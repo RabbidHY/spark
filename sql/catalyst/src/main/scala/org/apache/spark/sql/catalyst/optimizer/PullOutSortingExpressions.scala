@@ -52,6 +52,6 @@ object PullOutSortingExpressions extends Rule[LogicalPlan] {
         } else {
           s
         }
-    }
+     }
   }
 }
