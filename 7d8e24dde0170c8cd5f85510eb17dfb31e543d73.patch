@@ -1,0 +1,168 @@
+From 7d8e24dde0170c8cd5f85510eb17dfb31e543d73 Mon Sep 17 00:00:00 2001
+From: Yuming Wang <yumwang@ebay.com>
+Date: Wed, 22 Sep 2021 15:37:24 +0800
+Subject: [PATCH] Pull out sorting expressions
+
+---
+ .../sql/catalyst/optimizer/Optimizer.scala    |  1 +
+ .../optimizer/PullOutSortingExpressions.scala | 57 ++++++++++++++
+ .../PullOutSortingExpressionsSuite.scala      | 74 +++++++++++++++++++
+ 3 files changed, 132 insertions(+)
+ create mode 100644 sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressions.scala
+ create mode 100644 sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressionsSuite.scala
+
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
+index bf974c73d321c..eecdca8aff92f 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/Optimizer.scala
+@@ -157,6 +157,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
+       ReplaceExpressions,
+       RewriteNonCorrelatedExists,
+       PullOutGroupingExpressions,
++      PullOutSortingExpressions,
+       ComputeCurrentTime,
+       ReplaceCurrentLike(catalogManager),
+       SpecialDatetimeValues) ::
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressions.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressions.scala
+new file mode 100644
+index 0000000000000..f452f8b694803
+--- /dev/null
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressions.scala
+@@ -0,0 +1,57 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.catalyst.optimizer
++
++import scala.collection.mutable
++
++import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, NamedExpression}
++import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, Sort}
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.catalyst.trees.TreePattern.SORT
++
++/**
++ * This rule ensures that [[Sort]] nodes doesn't contain complex sorting expressions in the
++ * optimization phase if it is global sorting.
++ */
++object PullOutSortingExpressions extends Rule[LogicalPlan] {
++  override def apply(plan: LogicalPlan): LogicalPlan = {
++    plan.transformWithPruning(_.containsPattern(SORT)) {
++      case s: Sort if s.resolved && s.global =>
++        val complexSortingExpressionMap = mutable.LinkedHashMap.empty[Expression, NamedExpression]
++        s.order.map(_.child).foreach {
++          case e if !e.foldable && e.children.nonEmpty =>
++            complexSortingExpressionMap
++              .getOrElseUpdate(e.canonicalized, Alias(e, "_sortingexpression")())
++              .toAttribute
++          case o => o
++        }
++        if (complexSortingExpressionMap.nonEmpty) {
++          val newSortExpressions = s.order.map { s =>
++            val newChild = complexSortingExpressionMap.get(s.child.canonicalized).map(_.toAttribute)
++              .getOrElse(s.child)
++            s.copy(child = newChild)
++          }
++          val newChild = Project(s.child.output ++ complexSortingExpressionMap.values, s.child)
++          val x = Project(s.output, s.copy(order = newSortExpressions, child = newChild))
++          x
++        } else {
++          s
++        }
++    }
++  }
++}
+diff --git a/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressionsSuite.scala b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressionsSuite.scala
+new file mode 100644
+index 0000000000000..7d0025429abae
+--- /dev/null
++++ b/sql/catalyst/src/test/scala/org/apache/spark/sql/catalyst/optimizer/PullOutSortingExpressionsSuite.scala
+@@ -0,0 +1,74 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.catalyst.optimizer
++
++import org.apache.spark.sql.catalyst.dsl.expressions._
++import org.apache.spark.sql.catalyst.dsl.plans._
++import org.apache.spark.sql.catalyst.plans._
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.catalyst.rules._
++
++class PullOutSortingExpressionsSuite extends PlanTest {
++
++  object Optimize extends RuleExecutor[LogicalPlan] {
++    val batches = Batch("PullOutSortingExpressions", Once,
++      PullOutSortingExpressions,
++      CollapseProject) :: Nil
++  }
++
++  private val testRelation = LocalRelation('a.int, 'b.int, 'c.int)
++
++  test("Pull out sorting expressions") {
++    val originalQuery = testRelation.orderBy(('a - 'b).asc)
++
++    val optimized = Optimize.execute(originalQuery.analyze)
++    val correctAnswer =
++      testRelation
++        .select('a, 'b, 'c, ('a - 'b).as("_sortingexpression"))
++        .orderBy($"_sortingexpression".asc)
++        .select('a, 'b, 'c)
++        .analyze
++
++    comparePlans(optimized, correctAnswer)
++  }
++
++  test("Pull out sorting expressions: multiple sorting expressions") {
++    val originalQuery = testRelation.orderBy(('a - 'b).asc, 'a.asc, rand(1).asc)
++
++    val optimized = Optimize.execute(originalQuery.analyze)
++    val correctAnswer =
++      testRelation
++        .select('a, 'b, 'c, rand(1).as("_nondeterministic"))
++        .select('a, 'b, 'c, $"_nondeterministic", ('a - 'b).as("_sortingexpression"))
++        .orderBy($"_sortingexpression".asc, 'a.asc, $"_nondeterministic".asc)
++        .select('a, 'b, 'c)
++        .analyze
++
++    comparePlans(optimized, correctAnswer)
++  }
++
++  test("Shouldn't pull out sorting expressions if it is not global sorting") {
++    val originalQuery = testRelation.sortBy(('a - 'b).asc)
++    comparePlans(Optimize.execute(originalQuery.analyze), originalQuery.analyze)
++  }
++
++  test("Shouldn't pull out sorting expressions if there is no complex expressions") {
++    val originalQuery = testRelation.orderBy('a.asc, 'b.asc)
++    comparePlans(Optimize.execute(originalQuery.analyze), originalQuery.analyze)
++  }
++}
